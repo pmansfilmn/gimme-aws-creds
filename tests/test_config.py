@@ -37,6 +37,9 @@ class TestConfig(unittest.TestCase):
             action_list_roles=False,
             action_store_json_creds=False,
             action_setup_fido_authenticator=False,
+            open_browser=False,
+            force_classic=False,
+            disable_keychain=False
         ),
     )
     def test_get_args_username(self, mock_arg):
@@ -58,7 +61,7 @@ client_id = foo
         config = Config(gac_ui=test_ui, create_config=False)
         config.conf_profile = "myprofile"
         profile_config = config.get_config_dict()
-        self.assertEqual(profile_config, {"client_id": "foo"})
+        self.assertEqual(profile_config, {"client_id": "foo", 'force_classic': True})
 
     def test_read_config_inherited(self):
         """Test to make sure getting config works when inherited"""
@@ -72,6 +75,7 @@ client_id = foo
                 [mybase]
                 client_id = bar
                 aws_appname = baz
+                force_classic = True
                 [myprofile]
                 inherits = mybase
                 client_id = foo
@@ -86,6 +90,7 @@ client_id = foo
             "client_id": "foo",
             "aws_appname": "baz",
             "aws_rolename": "myrole",
+            'force_classic': True,
         })
 
     def test_read_nested_config_inherited(self):
@@ -101,6 +106,7 @@ client_id = bar
 [mybase-level2]
 inherits = mybase-level1
 aws_appname = baz
+force_classic = 
 [myprofile]
 inherits = mybase-level2
 client_id = foo
@@ -113,6 +119,7 @@ aws_rolename = myrole
             "client_id": "foo",
             "aws_appname": "baz",
             "aws_rolename": "myrole",
+            "force_classic": True
         })
 
     def test_fail_if_profile_not_found(self):

@@ -112,25 +112,49 @@ class TestMain(unittest.TestCase):
     def test_get_partition_aws(self):
         creds = GimmeAWSCreds()
 
-        partition = creds._get_partition_from_saml_acs('https://signin.aws.amazon.com/saml')
+        partition, region = creds._get_partition_and_region_from_saml_acs('https://signin.aws.amazon.com/saml')
         self.assertEqual(partition, 'aws')
+        self.assertEqual(region, 'us-east-1')
+
+    def test_get_region_partition_aws(self):
+        creds = GimmeAWSCreds()
+
+        partition, region = creds._get_partition_and_region_from_saml_acs('https://us-west-2.signin.aws.amazon.com/saml')
+        self.assertEqual(partition, 'aws')
+        self.assertEqual(region, 'us-west-2')
 
     def test_get_partition_china(self):
         creds = GimmeAWSCreds()
 
-        partition = creds._get_partition_from_saml_acs('https://signin.amazonaws.cn/saml')
+        partition, region = creds._get_partition_and_region_from_saml_acs('https://signin.amazonaws.cn/saml')
         self.assertEqual(partition, 'aws-cn')
+        self.assertEqual(region, 'cn-north-1')
+
+    def test_get_region_partition_china(self):
+        creds = GimmeAWSCreds()
+
+        partition, region = creds._get_partition_and_region_from_saml_acs('https://cn-northwest-1.signin.amazonaws.cn/saml')
+        self.assertEqual(partition, 'aws-cn')
+        self.assertEqual(region, 'cn-northwest-1')
 
     def test_get_partition_govcloud(self):
         creds = GimmeAWSCreds()
 
-        partition = creds._get_partition_from_saml_acs('https://signin.amazonaws-us-gov.com/saml')
+        partition, region = creds._get_partition_and_region_from_saml_acs('https://signin.amazonaws-us-gov.com/saml')
         self.assertEqual(partition, 'aws-us-gov')
+        self.assertEqual(region, 'us-gov-east-1')
+
+    def test_get_region_partition_govcloud(self):
+        creds = GimmeAWSCreds()
+
+        partition, region = creds._get_partition_and_region_from_saml_acs('https://us-gov-east-2.signin.amazonaws-us-gov.com/saml')
+        self.assertEqual(partition, 'aws-us-gov')
+        self.assertEqual(region, 'us-gov-east-2')
 
     def test_get_partition_unkown(self):
         creds = GimmeAWSCreds()
 
-        self.assertRaises(errors.GimmeAWSCredsExitBase, creds._get_partition_from_saml_acs,
+        self.assertRaises(errors.GimmeAWSCredsExitBase, creds._get_partition_and_region_from_saml_acs,
                           'https://signin.amazonaws-foo.com/saml')
 
     def test_parse_role_arn_base_path(self):
@@ -204,6 +228,7 @@ class TestMain(unittest.TestCase):
         include_path = 'True'
         self.assertEqual(creds.get_profile_name(cred_profile, include_path, naming_data, resolve_alias, role),
                          "123456789012-/some/long/extended/path/administrator")
+
     def test_get_profile_name_role(self):
         "Testing the role"
         creds = GimmeAWSCreds()
@@ -217,6 +242,34 @@ class TestMain(unittest.TestCase):
         include_path = 'True'
         self.assertEqual(creds.get_profile_name(cred_profile, include_path, naming_data, resolve_alias, role),
                          'administrator')
+
+    def test_get_profile_name_account_resolve_alias(self):
+        "Testing the account with alias resolution"
+        creds = GimmeAWSCreds()
+        naming_data = {'account': '123456789012', 'role': 'administrator', 'path': '/administrator/'}
+        role = RoleSet(idp='arn:aws:iam::123456789012:saml-provider/my-okta-provider',
+                       role='arn:aws:iam::123456789012:role/administrator/administrator',
+                       friendly_account_name='Account: my-org-master (123456789012)',
+                       friendly_role_name='administrator/administrator')
+        cred_profile = 'acc'
+        resolve_alias = 'True'
+        include_path = 'True'
+        self.assertEqual(creds.get_profile_name(cred_profile, include_path, naming_data, resolve_alias, role),
+                         'my-org-master')
+
+    def test_get_profile_name_account_do_not_resolve_alias(self):
+        "Testing the account without alias resolution"
+        creds = GimmeAWSCreds()
+        naming_data = {'account': '123456789012', 'role': 'administrator', 'path': '/administrator/'}
+        role = RoleSet(idp='arn:aws:iam::123456789012:saml-provider/my-okta-provider',
+                       role='arn:aws:iam::123456789012:role/administrator/administrator',
+                       friendly_account_name='Account: my-org-master (123456789012)',
+                       friendly_role_name='administrator/administrator')
+        cred_profile = 'acc'
+        resolve_alias = 'False'
+        include_path = 'True'
+        self.assertEqual(creds.get_profile_name(cred_profile, include_path, naming_data, resolve_alias, role),
+                         '123456789012')
 
     def test_get_profile_name_default(self):
         "Testing the default"

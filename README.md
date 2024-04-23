@@ -1,7 +1,7 @@
 # Gimme AWS Creds
 
 [![][license img]][license]
-[![Build Status](https://travis-ci.org/Nike-Inc/gimme-aws-creds.svg?branch=master)](https://travis-ci.org/Nike-Inc/gimme-aws-creds)
+[![][cicd img]][cicd]
 
 gimme-aws-creds is a CLI that utilizes an [Okta](https://www.okta.com/) IdP via SAML to acquire temporary AWS credentials via AWS STS.
 
@@ -9,11 +9,14 @@ Okta is a SAML identity provider (IdP), that can be easily set-up to do SSO to y
 
 With gimme-aws-creds all you need to know is your username, password, Okta url and MFA token, if MFA is enabled. gimme-aws-creds gives you the option to select which Okta AWS application and role you want credentials for. Alternatively, you can pre-configure the app and role name by passing -c or editing the config file. This is all covered in the usage section.
 
+## Disclaimer
+Okta is a registered trademark of Okta, Inc. and this tool has no affiliation with or sponsorship by Okta, Inc.
+
 ## Prerequisites
 
 [Okta SAML integration to AWS using the AWS App](https://help.okta.com/en/prod/Content/Topics/Miscellaneous/References/OktaAWSMulti-AccountConfigurationGuide.pdf)
 
-Python 3.6+
+Python 3.7+
 
 ### Optional
 
@@ -42,7 +45,7 @@ __OR__
 Install the gimme-aws-creds package if you have already cloned the source:
 
 ```bash
-python3 setup.py install
+python -m pip install .
 ```
 
 __OR__
@@ -51,6 +54,66 @@ Use homebrew
 
 ```bash
 brew install gimme-aws-creds
+```
+
+__OR__
+
+Use with nix flakes
+```bash
+# flake.nix
+# Use by running `nix develop`
+{
+  description = "Shell example";
+
+  inputs.flake-utils.url = "github:numtide/flake-utils";
+  inputs.nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+  inputs.gimme-aws-creds.url = "github:Nike-Inc/gimme-aws-creds";
+
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    gimme-aws-creds,
+    ...
+  } @ inputs:
+    flake-utils.lib.eachDefaultSystem
+    (
+      system: let
+        pkgs = nixpkgs.legacyPackages.${system};
+      in {
+        devShells.default = pkgs.mkShell {
+          packages = [pkgs.bash gimme-aws-creds.defaultPackage.${system}];
+        };
+      }
+    );
+}
+```
+
+__OR__
+
+Use with original nix
+```bash
+# shell.nix
+# Use by running `nix-shell`
+{pkgs ? import <nixpkgs> {}, ...}:
+with pkgs; let
+  gimme-src = fetchgit {
+    name = "gimme-aws-creds";
+    url = "https://github.com/Nike-Inc/gimme-aws-creds";
+    branchName = "master";
+    sha256 = "<replace>"; #nix-prefetch-url --unpack https://github.com/Nike-Inc/gimme-aws-creds/archive/master.tar.gz
+  };
+
+  gimme-aws-creds = import gimme-src;
+in
+  mkShell rec {
+    name = "gimme-aws-creds";
+
+    buildInputs = [
+      bash
+      (gimme-aws-creds.default)
+    ];
+  }
 ```
 
 __OR__
@@ -74,6 +137,50 @@ alias gimme-aws-creds="docker run -it --rm \
 
 With this config, you will be able to run further commands seamlessly!
 
+## Command Auto Completion
+
+If you are using Bash or Zsh, you can add autocompletion for the gimme-aws-creds commandline options and profile names.  To add the autocomplete config, add the following to the end of your .bashrc or .zshrc:
+
+.bashrc
+```bash
+INSTALL_DIR=$(dirname $(which gimme-aws-creds))
+source ${INSTALL_DIR}/gimme-aws-creds-autocomplete.sh"
+```
+
+.zshrc
+```bash
+INSTALL_DIR=$(dirname $(which gimme-aws-creds))
+autoload bashcompinit
+bashcompinit
+source ${INSTALL_DIR}/gimme-aws-creds-autocomplete.sh
+```
+
+## Using gimme-aws-creds with Okta Identity Engine
+
+There are two options for using gimme-aws-creds with an OIE domain:
+* Device Authorization Flow
+* Forcing the use of the Okta Classic login flow
+
+### Okta Identity Engine and Device Authorization Flow
+This is the recommended method for authentication with OIE.  It matches the flow used by Okta's [AWS client](https://github.com/okta/okta-aws-cli).  When using gimme-aws-creds with the Device Authorization flow, you will authenticate using your browser.  Storing credentials in keychain or passing MFA codes through the command-line is NOT POSSIBLE.
+
+To use gimme-aws-creds with an Okta Identity Engine (OIE) domain, you must create a new OIDC Native Application and connect it to your AWS integration app(s).
+
+The OIDC Native Application requires Grant Types `Authorization Code`, `Device Authorization` , and `Token Exchange`. These settings are in the Okta Admin UI at `Applications > [the OIDC app] > General Settings > Grant type`.
+
+The pairing with the AWS Federation Application is achieved in the Fed app's Sign On Settings. These settings are in the Okta Admin UI at `Applications > [the AWS Fed app] > Sign On`. Make sure to set the `Allowed Web SSO Client` value to the Client ID of the OIDC Native Application. Repeat that setting for each AWS application you want to access with gimme-aws-creds.
+
+Finally, set the Client ID in gimme-aws-creds (`gimme-aws-creds --action-configure` or update the `client_id` parameter in your config file)
+
+Make sure to use the same authentication policy for both the AWS Federation Application and the OIDC application ( or at least use equivalent policy rules for both).  If not, you'll receive a `400 Bad Request` response when requesting the Web SSO token.
+
+### Forcing the use of the Okta Classic login flow ###
+The login flow used in Okta Classic currently still works with Okta Identity Engine domains, BUT there are a couple caveats:
+* The Okta classic flow passes the `stateToken` parameter when requesting "step-up" authentication.  This capability was removed in OIE, so if the authentication policy on your AWS app(s) requires MFA but the Global Session Policy does not (or if a higher level of MFA factor is required to access AWS), you cannot authenticate using the classic login flow.
+* MFA using Okta Verify is only supported on mobile devices.  Okta Verify on macOS/Windows is not supported.
+* Passwordless authentication and endpoint security checks are not supported.
+
+
 ## Configuration
 
 To set-up the configuration run:
@@ -82,7 +189,7 @@ To set-up the configuration run:
 gimme-aws-creds --action-configure
 ```
 
-You can also set up different Okta configuration profiles, this useful if you have multiple Okta accounts or environments you need credentials for. You can use the configuration wizard or run:
+You can also set up different Okta configuration profiles, this is useful if you have multiple Okta accounts or environments you need credentials for. You can use the configuration wizard or run:
 
 ```bash
 gimme-aws-creds --action-configure --profile profileName
@@ -93,7 +200,7 @@ A configuration wizard will prompt you to enter the necessary configuration para
 - conf_profile - This sets the Okta configuration profile name, the default is DEFAULT.
 - okta_org_url - This is your Okta organization url, which is typically something like `https://companyname.okta.com`.
 - okta_auth_server - [Okta API Authorization Server](https://help.okta.com/en/prev/Content/Topics/Security/API_Access.htm) used for OpenID Connect authentication for gimme-creds-lambda
-- client_id - OAuth client ID for gimme-creds-lambda
+- client_id - OAuth client ID for user authentication in Okta Identity Engine and gimme-creds-lambda in Okta "classic"
 - gimme_creds_server
   - URL for gimme-creds-lambda
   - 'internal' for direct interaction with the Okta APIs (`OKTA_API_KEY` environment variable required)
@@ -101,7 +208,8 @@ A configuration wizard will prompt you to enter the necessary configuration para
 - write_aws_creds - True or False - If True, the AWS credentials will be written to `~/.aws/credentials` otherwise it will be written to stdout.
 - cred_profile - If writing to the AWS cred file, this sets the name of the AWS credential profile.
   - The reserved word `role` will use the name component of the role arn as the profile name. i.e. arn:aws:iam::123456789012:role/okta-1234-role becomes section [okta-1234-role] in the aws credentials file
-  - The reserved word `acc-role` will use the name component of the role arn prepended with account number (or alias if `resolve_aws_alias` is set to y) to avoid collisions, i.e. arn:aws:iam::123456789012:role/okta-1234-role becomes section [123456789012-okta-1234-role], or if `resolve_aws_alias` [<my alias>-okta-1234-role] in the aws credentials file
+  - The reserved word `acc` will use the account number (or alias if `resolve_aws_alias` is set to y) as the profile name. i.e. arn:aws:iam::123456789012:role/okta-1234-role becomes section [arn:aws:iam::123456789012] or if `resolve_aws_alias` [okta-1234-role] in the aws credentials file.
+  - The reserved word `acc-role` will use the name component of the role arn prepended with account number (or alias if `resolve_aws_alias` is set to y) to avoid collisions, i.e. arn:aws:iam::123456789012:role/okta-1234-role becomes section [123456789012-okta-1234-role], or if `resolve_aws_alias` [okta-1234-role] in the aws credentials file
   - If set to `default` then the temp creds will be stored in the default profile
   - Note: if there are multiple roles, and `default` is selected it will be overwritten multiple times and last role wins. The same happens when `role` is selected and you have many accounts with the same role names. Consider using `acc-role` if this happens.
 - aws_appname - This is optional. The Okta AWS App name, which has the role you want to assume.
@@ -109,19 +217,31 @@ A configuration wizard will prompt you to enter the necessary configuration para
 - aws_default_duration = This is optional. Lifetime for temporary credentials, in seconds. Defaults to 1 hour (3600)
 - app_url - If using 'appurl' setting for gimme_creds_server, this sets the url to the aws application configured in Okta. It is typically something like <https://something.okta[preview].com/home/amazon_aws/app_instance_id/something>
 - okta_username - use this username to authenticate
+- enable_keychain - enable the use of the system keychain to store the user's password
 - preferred_mfa_type - automatically select a particular  device when prompted for MFA:
   - push - Okta Verify App push or DUO push (depends on okta supplied provider type)
   - token:software:totp - OTP using the Okta Verify App
   - token:hardware - OTP using hardware like Yubikey
   - call - OTP via Voice call
   - sms - OTP via SMS message
+  - email - OTP via email
   - web - DUO uses localhost webbrowser to support push|call|passcode
   - passcode - DUO uses `OKTA_MFA_CODE` or `--mfa-code` if set, or prompts user for passcode(OTP).
-  
+  - claims_provider - DUO Universal Prompt
+- preferred_mfa_provider - (optional) automatically select a particular provider when prompted for MFA:
+  - GOOGLE
+  - OKTA
+  - DUO
+- duo_universal_factor - (optional) Configure which type of factor to use with Duo Universal Prompt. Must be one of (case-sensitive):
+  - `Duo Push` (default)
+  - `Passcode`
+  - `Phone Call`
 - resolve_aws_alias - y or n. If yes, gimme-aws-creds will try to resolve AWS account ids with respective alias names (default: n). This option can also be set interactively in the command line using `-r` or `--resolve` parameter
 - include_path - (optional) Includes full role path to the role name in AWS credential profile name. (default: n).  If `y`: `<acct>-/some/path/administrator`. If `n`: `<acct>-administrator`
 - remember_device - y or n. If yes, the MFA device will be remembered by Okta service for a limited time. This option can also be set interactively in the command line using `-m` or `--remember-device`
-- output_format - `json` or `export`, determines default credential output format, can be also specified by `--output-format FORMAT` and `-o FORMAT`.
+- output_format - `json` , `export` or `windows`, determines default credential output format, can be also specified by `--output-format FORMAT` and `-o FORMAT`.
+- open-browser - Open the device authentication link in the default web browser automatically (Okta Identity Engine domains only)
+- force-classic - Force the use of the Okta Classic login process (Okta Identity Engine domains only)
 
 ## Configuration File
 
@@ -174,7 +294,7 @@ export AWS_ACCESS_KEY_ID=AQWERTYUIOP
 export AWS_SECRET_ACCESS_KEY=T!#$JFLOJlsoddop1029405-P
 ```
 
-You can automate the environment variable creation by running `$(gimme-aws-creds)` on linux or `iex (gimme-aws-creds)` using Windows Powershell
+You can automate the environment variable creation by running `$(gimme-aws-creds)` on linux or `gimme-aws-creds | iex` using Windows Powershell
 
 You can run a specific configuration profile with the `--profile` parameter:
 
@@ -203,6 +323,7 @@ A list of values of to change with environment variables are:
 - `OKTA_MFA_CODE` - corresponds to `--mfa-code` CLI option
 - `OKTA_PASSWORD` - provides password during authentication, can be used in CI
 - `OKTA_USERNAME` - corresponds to `okta_username` configuration and `--username` CLI option
+- `AWS_STS_REGION` - force the use of the STS in a specific region (`us-east-1`, `eu-north-1`, etc.)
 
 Example: `GIMME_AWS_CREDS_CLIENT_ID='foobar' AWS_DEFAULT_DURATION=12345 gimme-aws-creds`
 
@@ -215,6 +336,10 @@ For changing variables outside of this, you'd need to create a separate profile 
 ### Viewing roles
 
 `gimme-aws-creds --action-list-roles` will print all available roles to STDOUT without retrieving their credentials.
+
+### Credential expiration time
+
+Writing to the AWS credentials file will include the `x_security_token_expires` value in RFC3339 format. This allows tools to validate if the credentials are expiring or are expiring soon and warn the user or trigger a refresh.
 
 ### Generate credentials as json
 
@@ -259,7 +384,7 @@ for data in creds.iter_selected_aws_credentials():
         if len(piece) == 12 and piece.isdigit():
             account_id = piece
             break
-  
+
     if account_id is None:
         raise ValueError("Didn't find aws_account_id (12 digits) in {}".format(arn))
 
@@ -275,7 +400,7 @@ gimme-aws-creds works both on FIDO1 enabled org and WebAuthN enabled org
 Note that FIDO1 will probably be deprecated in the near future as standards moves forward to WebAuthN
 
 WebAuthN support is available for usb security keys (gimme-aws-creds relies on the yubico fido2 lib).
- 
+
 To use your local machine as an authenticator, along with Touch ID or Windows Hello, if available,
 you must register a new authenticator via gimme-aws-creds, using:
 ```bash
@@ -286,15 +411,15 @@ Then, you can choose the newly registered authenticator from the factors list.
 
 ## Running Tests
 
-You can run all the unit tests using nosetests. Most of the tests are mocked.
+You can run all the unit tests using pytest. Most of the tests are mocked.
 
 ```bash
-nosetests --verbosity=2 tests/
+pytest -vv tests
 ```
 
 ## Maintenance
 
-This project is maintained by [Ann Wallace](https://github.com/anners), [Eric Pierce](https://github.com/epierce), and [Justin Wiley](https://github.com/sector95).
+This project is maintained by [Eric Pierce](https://github.com/epierce)
 
 ## Thanks and Credit
 
@@ -302,7 +427,9 @@ I came across [okta_aws_login](https://github.com/nimbusscale/okta_aws_login) wr
 
 ## Etc
 
-[Okta's Java tool](https://github.com/oktadeveloper/okta-aws-cli-assume-role)
+[okta-aws-cli](https://github.com/okta/okta-aws-cli)
+
+[okta-aws-cli-assume-role](https://github.com/oktadev/okta-aws-cli-assume-role)
 
 [AWS - How to Implement Federated API and CLI Access Using SAML 2.0 and AD FS](https://aws.amazon.com/blogs/security/how-to-implement-federated-api-and-cli-access-using-saml-2-0-and-ad-fs/)
 
@@ -314,3 +441,5 @@ Gimme AWS Creds is released under the [Apache License, Version 2.0](http://www.a
 
 [license]:LICENSE
 [license img]:https://img.shields.io/badge/License-Apache%202-blue.svg
+[cicd]:https://github.com/Nike-Inc/gimme-aws-creds/actions/workflows/cicd.yml
+[cicd img]:https://github.com/Nike-Inc/gimme-aws-creds/actions/workflows/cicd.yml/badge.svg

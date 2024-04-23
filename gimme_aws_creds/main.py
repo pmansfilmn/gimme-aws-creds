@@ -17,67 +17,30 @@ import json
 import os
 import re
 import sys
+import concurrent.futures
 
 # extras
 import boto3
+import requests
 from botocore.exceptions import ClientError
-from okta.framework.ApiClient import ApiClient
-from okta.framework.OktaError import OktaError
+from okta.api_client import APIClient
+from okta.errors.error import Error as OktaError
 
 # local imports
-from . import errors, ui
+from . import errors, ui, version
 from .aws import AwsResolver
 from .config import Config
 from .default import DefaultResolver
-from .okta import OktaClient
+from .okta_identity_engine import OktaIdentityEngine
+from .okta_classic import OktaClassicClient
 from .registered_authenticators import RegisteredAuthenticators
 
 
 class GimmeAWSCreds(object):
     """
        This is a CLI tool that gets temporary AWS credentials
-       from Okta based the available AWS Okta Apps and roles
-       assigned to the user. The user is able to select the app
-       and role from the CLI or specify them in a config file by
-       passing --action-configure to the CLI too.
-       gimme_aws_creds will either write the credentials to stdout
-       or ~/.aws/credentials depending on what was specified when
-       --action-configure was ran.
-
-       Usage:
-          -h, --help            show this help message and exit
-          --username USERNAME, -u USERNAME
-                                The username to use when logging into Okta. The
-                                username can also be set via the OKTA_USERNAME env
-                                variable. If not provided you will be prompted to
-                                enter a username.
-          --action-configure, -c       If set, will prompt user for configuration parameters
-                                and then exit.
-          --profile PROFILE, -p PROFILE
-                                If set, the specified configuration profile will be
-                                used instead of the default.
-          --resolve, -r         If set, performs alias resolution.
-          --insecure, -k        Allow connections to SSL sites without cert
-                                verification.
-          --mfa-code MFA_CODE   The MFA verification code to be used with SMS or TOTP
-                                authentication methods. If not provided you will be
-                                prompted to enter an MFA verification code.
-          --remember-device, -m
-                                The MFA device will be remembered by Okta service for
-                                a limited time, otherwise, you will be prompted for it
-                                every time.
-          --version             gimme-aws-creds version
-
-        Config Options:
-           okta_org_url = Okta URL
-           gimme_creds_server = URL of the gimme-creds-server
-           client_id = OAuth Client id for the gimme-creds-server
-           okta_auth_server = Server ID for the OAuth authorization server used by gimme-creds-server
-           write_aws_creds = Option to write creds to ~/.aws/credentials
-           cred_profile = Use DEFAULT or Role-based name as the profile in ~/.aws/credentials
-           aws_appname = (optional) Okta AWS App Name
-           aws_rolename =  (optional) AWS Role ARN. 'ALL' will retrieve all roles, can be a CSV for multiple roles.
-           okta_username = (optional) Okta User Name
+       from Okta based on the available AWS Okta Apps and roles
+       assigned to the user.
     """
     resolver = DefaultResolver()
     envvar_list = [
@@ -92,6 +55,7 @@ class GimmeAWSCreds(object):
         'OKTA_MFA_CODE',
         'OKTA_PASSWORD',
         'OKTA_USERNAME',
+        'AWS_STS_REGION'
     ]
 
     envvar_conf_map = {
@@ -99,6 +63,7 @@ class GimmeAWSCreds(object):
         'GIMME_AWS_CREDS_CRED_PROFILE': 'cred_profile',
         'GIMME_AWS_CREDS_OUTPUT_FORMAT': 'output_format',
         'OKTA_DEVICE_TOKEN': 'device_token',
+        'AWS_STS_REGION': 'aws_region'
     }
 
     def __init__(self, ui=ui.cli):
@@ -112,9 +77,10 @@ class GimmeAWSCreds(object):
             os.path.join(self.FILE_ROOT, '.aws', 'credentials')
         )
         self._cache = {}
+        self.skip_DT = False
 
     #  this is modified code from https://github.com/nimbusscale/okta_aws_login
-    def _write_aws_creds(self, profile, access_key, secret_key, token, aws_config=None):
+    def _write_aws_creds(self, profile, access_key, secret_key, token, expiration, aws_config=None):
         """ Writes the AWS STS token into the AWS credential file"""
         # Check to see if the aws creds path exists, if not create it
         aws_config = aws_config or self.AWS_CONFIG
@@ -138,13 +104,14 @@ class GimmeAWSCreds(object):
         config.set(profile, 'aws_secret_access_key', secret_key)
         config.set(profile, 'aws_session_token', token)
         config.set(profile, 'aws_security_token', token)
+        config.set(profile, 'x_security_token_expires', expiration)
 
         # Write the updated config file
         with open(aws_config, 'w+') as configfile:
             config.write(configfile)
         # Update file permissions to secure  sensitive credentials file
         os.chmod(aws_config, 0o600)
-        self.ui.result('Written profile {} to {}'.format(profile, aws_config))
+        self.ui.message('Written profile {} to {}'.format(profile, aws_config))
 
     def write_aws_creds_from_data(self, data, aws_config=None):
         if not isinstance(data, dict):
@@ -169,7 +136,8 @@ class GimmeAWSCreds(object):
         else:
             for key in ('aws_access_key_id',
                         'aws_secret_access_key',
-                        'aws_session_token'):
+                        'aws_session_token',
+                        'expiration'):
                 value = credentials.get(key, None)
                 if not value:
                     errs.append(
@@ -181,38 +149,53 @@ class GimmeAWSCreds(object):
             return
 
         arn = data.get('role', {}).get('arn', '<no-arn>')
-        self.ui.result('Saving {} as {}'.format(arn, profile['name']))
+        self.ui.message('Saving {} as {}'.format(arn, profile['name']))
         self._write_aws_creds(
             profile['name'],
             credentials['aws_access_key_id'],
             credentials['aws_secret_access_key'],
             credentials['aws_session_token'],
+            credentials['expiration'],
             aws_config=aws_config,
         )
 
     @staticmethod
-    def _get_partition_from_saml_acs(saml_acs_url):
-        """ Determine the AWS partition by looking at the ACS endpoint URL"""
-        if saml_acs_url == 'https://signin.aws.amazon.com/saml':
-            return 'aws'
-        elif saml_acs_url == 'https://signin.amazonaws.cn/saml':
-            return 'aws-cn'
-        elif saml_acs_url == 'https://signin.amazonaws-us-gov.com/saml':
-            return 'aws-us-gov'
+    def _get_partition_and_region_from_saml_acs(saml_acs_url):
+        """ Determine the AWS partition and region by looking at the ACS endpoint URL. """
+        if saml_acs_url.endswith('signin.aws.amazon.com/saml'):
+            match = re.search(r"https:\/\/(.*)\.signin\.aws\.amazon\.com\/saml", saml_acs_url)
+            if match is None:
+                return('aws', 'us-east-1')
+            else:
+                return ('aws', match.group(1))
+        elif saml_acs_url.endswith('signin.amazonaws.cn/saml'):
+            match = re.search(r"https:\/\/(.*)\.signin\.amazonaws\.cn\/saml", saml_acs_url)
+            if match is None:
+                return('aws-cn', 'cn-north-1')
+            else:
+                return ('aws-cn', match.group(1))
+        elif saml_acs_url.endswith('signin.amazonaws-us-gov.com/saml'):
+            match = re.search(r"https:\/\/(.*)\.signin\.amazonaws-us-gov\.com\/saml", saml_acs_url)
+            if match is None:
+                return('aws-us-gov', 'us-gov-east-1')
+            else:
+                return ('aws-us-gov', match.group(1))
         else:
             raise errors.GimmeAWSCredsError("{} is an unknown ACS URL".format(saml_acs_url))
 
     @staticmethod
-    def _get_sts_creds(partition, assertion, idp, role, duration=3600):
+    def _get_sts_creds(partition, region, assertion, idp, role, duration=3600):
         """ using the assertion and arns return aws sts creds """
 
-        # Use the first available region for partitions other than the public AWS
         session = boto3.session.Session(profile_name=None)
-        if partition != 'aws':
+
+        # If a region was passed, use that
+        if region is not None:
+            client = session.client('sts', region)
+        # Use the first available region
+        else:
             regions = session.get_available_regions('sts', partition)
             client = session.client('sts', regions[0])
-        else:
-            client = session.client('sts')
 
         response = client.assume_role_with_saml(
             RoleArn=role,
@@ -239,8 +222,8 @@ class GimmeAWSCreds(object):
         """ Call the Okta User API and process the results to return
         just the information we need for gimme_aws_creds"""
         # We need access to the entire JSON response from the Okta APIs, so we need to
-        # use the low-level ApiClient instead of UsersClient and AppInstanceClient
-        users_client = ApiClient(okta_org_url, okta_api_key, pathname='/api/v1/users')
+        # use the low-level APIClient instead of UsersClient and AppInstanceClient
+        users_client = APIClient(okta_org_url, okta_api_key, pathname='/api/v1/users')
 
         # Get User information
         try:
@@ -478,6 +461,9 @@ class GimmeAWSCreds(object):
         config.get_args()
         self._cache['conf_dict'] = config.get_config_dict()
 
+        if config.disable_keychain is True:
+            self.conf_dict['enable_keychain'] = False
+
         for value in self.envvar_list:
             if self.ui.environ.get(value):
                 key = self.envvar_conf_map.get(value, value).lower()
@@ -512,6 +498,47 @@ class GimmeAWSCreds(object):
     def output_format(self):
         return self.conf_dict.setdefault('output_format', self.config.output_format)
 
+    def set_okta_platform(self, okta_platform):
+        self._cache['okta_platform'] = okta_platform
+
+    @property
+    def okta_platform(self):
+        if 'okta_platform' in self._cache:
+            return self._cache['okta_platform']
+
+        response = requests.get(
+            self.okta_org_url + '/.well-known/okta-organization',
+            headers={
+                'Accept': 'application/json',
+                'User-Agent': "gimme-aws-creds {}".format(version)
+            },
+            timeout=30
+        )
+
+        response_data = response.json()
+
+        if response.status_code == 200:
+            if response_data['pipeline'] == 'v1':
+                ret = 'classic'
+            elif response_data['pipeline'] == 'idx':
+                ret = 'identity_engine'
+                # Force_Classic is set - treat this domain as classic
+                if self.config.force_classic is True or self.conf_dict.get('force_classic') is True:
+                    self.ui.message('Okta Classic login flow enabled')
+                    ret = 'classic'
+                    # Skip Device Token registration
+                    self.skip_DT = True
+                else:
+                    if not self.conf_dict.get('client_id'):
+                        raise errors.GimmeAWSCredsError('OAuth Client ID is required for Okta Identity Engine domains.  Try running --config again.')
+            else:
+                raise RuntimeError('Unknown Okta platform type: {}'.format(response_data['pipeline']))
+        else:
+            response.raise_for_status()
+
+        self.set_okta_platform(ret)
+        return ret
+
     @property
     def okta_org_url(self):
         ret = self.conf_dict.get('okta_org_url')
@@ -531,31 +558,46 @@ class GimmeAWSCreds(object):
         if 'okta' in self._cache:
             return self._cache['okta']
 
-        okta = self._cache['okta'] = OktaClient(
-            self.ui,
-            self.okta_org_url,
-            self.config.verify_ssl_certs,
-            self.device_token,
-        )
+        if self.okta_platform == 'identity_engine':
+            okta = self._cache['okta'] = OktaIdentityEngine(
+                self.ui,
+                self.okta_org_url,
+                self.conf_dict.get('client_id'),
+                self.config.verify_ssl_certs
+            )
+        else:
+            okta = self._cache['okta'] = OktaClassicClient(
+                self.ui,
+                self.okta_org_url,
+                self.config.verify_ssl_certs,
+                self.device_token,
+                self.conf_dict.get('enable_keychain', True)
+            )
 
-        if self.config.username is not None:
-            okta.set_username(self.config.username)
-        elif self.conf_dict.get('okta_username'):
-            okta.set_username(self.conf_dict['okta_username'])
+            if self.config.username is not None:
+                okta.set_username(self.config.username)
+            elif self.conf_dict.get('okta_username'):
+                okta.set_username(self.conf_dict['okta_username'])
 
-        if self.conf_dict.get('okta_password'):
-            okta.set_password(self.conf_dict['okta_password'])
+            if self.conf_dict.get('okta_password'):
+                okta.set_password(self.conf_dict['okta_password'])
 
-        if self.conf_dict.get('preferred_mfa_type'):
-            okta.set_preferred_mfa_type(self.conf_dict['preferred_mfa_type'])
+            if self.conf_dict.get('preferred_mfa_type'):
+                okta.set_preferred_mfa_type(self.conf_dict['preferred_mfa_type'])
 
-        if self.config.mfa_code is not None:
-            okta.set_mfa_code(self.config.mfa_code)
-        elif self.conf_dict.get('okta_mfa_code'):
-            okta.set_mfa_code(self.conf_dict.get('okta_mfa_code'))
+            if self.conf_dict.get('preferred_mfa_provider'):
+                okta.set_preferred_mfa_provider(self.conf_dict['preferred_mfa_provider'])
 
-        okta.set_remember_device(self.config.remember_device
-                                 or self.conf_dict.get('remember_device', False))
+            if self.conf_dict.get('duo_universal_factor'):
+                okta.set_duo_universal_factor(self.conf_dict.get('duo_universal_factor'))
+
+            if self.config.mfa_code is not None:
+                okta.set_mfa_code(self.config.mfa_code)
+            elif self.conf_dict.get('okta_mfa_code'):
+                okta.set_mfa_code(self.conf_dict.get('okta_mfa_code'))
+
+            okta.set_remember_device(self.config.remember_device
+                or self.conf_dict.get('remember_device', False))
         return okta
 
     def get_resolver(self):
@@ -567,7 +609,7 @@ class GimmeAWSCreds(object):
 
     @property
     def device_token(self):
-        if self.config.action_register_device is True:
+        if self.config.action_register_device is True or self.skip_DT is True:
             self.conf_dict['device_token'] = None
 
         return self.conf_dict.get('device_token')
@@ -579,8 +621,13 @@ class GimmeAWSCreds(object):
     def auth_session(self):
         if 'auth_session' in self._cache:
             return self._cache['auth_session']
-        auth_result = self.okta.auth_session(redirect_uri=self.conf_dict.get('app_url'))
+        if self.config.open_browser is True or self.conf_dict.get('open_browser') is True:
+            open_browser = True
+        else:
+            open_browser = False
+        auth_result = self.okta.auth_session(redirect_uri=self.conf_dict.get('app_url'), open_browser=open_browser)
         self.set_auth_session(auth_result)
+
         return auth_result
 
     @property
@@ -622,14 +669,21 @@ class GimmeAWSCreds(object):
                 raise errors.GimmeAWSCredsError(
                     'No OAuth Authorization server in configuration.  Try running --config again.')
 
-            # Authenticate with Okta and get an OAuth access token
-            self.okta.auth_oauth(
-                self.conf_dict['client_id'],
-                authorization_server=self.conf_dict['okta_auth_server'],
-                access_token=True,
-                id_token=False,
-                scopes=['openid']
-            )
+            if self.okta_platform == 'classic':
+                # Authenticate with Okta and get an OAuth access token
+                self.okta.auth_oauth(
+                    self.conf_dict['client_id'],
+                    authorization_server=self.conf_dict['okta_auth_server'],
+                    access_token=True,
+                    id_token=False,
+                    scopes=['openid']
+                )
+
+                # auth_session isn't needed when using gimme_creds_lambda and Okta classic
+                self.set_auth_session(None)
+
+            elif self.okta_platform == 'identity_engine':
+                auth_result = self.auth_session
 
             # Add Access Tokens to Okta-protected requests
             self.okta.use_oauth_access_token(True)
@@ -651,7 +705,7 @@ class GimmeAWSCreds(object):
     def saml_data(self):
         if 'saml_data' in self._cache:
             return self._cache['saml_data']
-        self._cache['saml_data'] = saml_data = self.okta.get_saml_response(self.aws_app['links']['appLink'])
+        self._cache['saml_data'] = saml_data = self.okta.get_saml_response(self.aws_app['links']['appLink'], self.auth_session)
         return saml_data
 
     @property
@@ -688,7 +742,11 @@ class GimmeAWSCreds(object):
     def aws_partition(self):
         if 'aws_partition' in self._cache:
             return self._cache['aws_partition']
-        self._cache['aws_partition'] = aws_partition = self._get_partition_from_saml_acs(self.saml_data['TargetUrl'])
+        aws_partition, aws_region = self._get_partition_and_region_from_saml_acs(self.saml_data['TargetUrl'])
+        self._cache['aws_partition'] = aws_partition
+        # use the region of the SAML ACS if one wasn't specified by the user
+        if self.conf_dict.get('aws_region') is None:
+            self.conf_dict['aws_region'] = aws_region
         return aws_partition
 
     def prepare_data(self, role, generate_credentials=False):
@@ -697,6 +755,7 @@ class GimmeAWSCreds(object):
             try:
                 aws_creds = self._get_sts_creds(
                     self.aws_partition,
+                    self.conf_dict.get('aws_region'),
                     self.saml_data['SAMLResponse'],
                     role.idp,
                     role.role,
@@ -705,9 +764,10 @@ class GimmeAWSCreds(object):
             except ClientError as ex:
                 if 'requested DurationSeconds exceeds the MaxSessionDuration' in ex.response['Error']['Message']:
                     self.ui.warning(
-                        "The requested session duration was too long for this role.  Falling back to 1 hour.")
+                        "The requested session duration was too long for the role {}.  Falling back to 1 hour.".format(role.role))
                     aws_creds = self._get_sts_creds(
                         self.aws_partition,
+                        self.conf_dict.get('aws_region'),
                         self.saml_data['SAMLResponse'],
                         role.idp,
                         role.role,
@@ -752,14 +812,12 @@ class GimmeAWSCreds(object):
             profile_name = 'default'
         elif cred_profile.lower() == 'role':
             profile_name = naming_data['role']
+        elif cred_profile.lower() == 'acc':
+            profile_name = self._get_account_name(naming_data['account'], role, resolve_alias)
         elif cred_profile.lower() == 'acc-role':
-            account = naming_data['account']
+            account = self._get_account_name(naming_data['account'], role, resolve_alias)
             role_name = naming_data['role']
             path = naming_data['path']
-            if resolve_alias == 'True':
-                account_alias = self._get_alias_from_friendly_name(role.friendly_account_name)
-                if account_alias:
-                    account = account_alias
             if include_path == 'True':
                 role_name = ''.join([path, role_name])
             profile_name = '-'.join([account,
@@ -768,14 +826,27 @@ class GimmeAWSCreds(object):
             profile_name = cred_profile
         return profile_name
 
+    def _get_account_name(self, account, role, resolve_alias):
+        if resolve_alias == "False":
+            return account
+        account_alias = self._get_alias_from_friendly_name(role.friendly_account_name)
+        return account_alias or account
+
     def iter_selected_aws_credentials(self):
         results = []
-        for role in self.aws_selected_roles:
+        aws_results = []
+
+        def generate_credentials_prepare_data(role):
             data = self.prepare_data(role, generate_credentials=True)
-            if not data:
+            return data
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            aws_results = executor.map(generate_credentials_prepare_data, self.aws_selected_roles)
+        for ar in aws_results:
+            if not ar:
                 continue
-            results.append(data)
-            yield data
+            results.append(ar)
+            yield ar
 
         self._cache['selected_aws_credentials'] = results
 
@@ -789,12 +860,14 @@ class GimmeAWSCreds(object):
     def _run(self):
         """ Pulling it all together to make the CLI """
         self.handle_action_configure()
-        self.handle_action_register_device()
         self.handle_action_list_profiles()
+        if self.okta_platform == 'classic':
+            self.handle_action_register_device()
+            self.handle_setup_fido_authenticator()
         self.handle_action_store_json_creds()
         self.handle_action_list_roles()
-        self.handle_setup_fido_authenticator()
-  
+
+
         # for each data item, if we have an override on output, prioritize that
         # if we do not, prioritize writing credentials to file if that is in our
         # configuration. If we are not writing to a credentials file, use whatever
@@ -819,6 +892,16 @@ class GimmeAWSCreds(object):
         if action == "json":
             self.ui.result(json.dumps(data))
             return
+        elif action == "windows":
+            self.ui.result("$env:AWS_ROLE_ARN=\"" + data['role']['arn']+"\"")
+            self.ui.result("$env:AWS_ACCESS_KEY_ID=\"" +
+                           data['credentials']['aws_access_key_id']+"\"")
+            self.ui.result("$env:AWS_SECRET_ACCESS_KEY=\"" +
+                           data['credentials']['aws_secret_access_key']+"\"")
+            self.ui.result("$env:AWS_SESSION_TOKEN=\"" +
+                           data['credentials']['aws_session_token']+"\"")
+            self.ui.result("$env:AWS_SECURITY_TOKEN=\"" +
+                           data['credentials']['aws_security_token']+"\"")
         else:
             # Defaults to `export` format
             self.ui.result("export AWS_ROLE_ARN=" + data['role']['arn'])
@@ -863,7 +946,7 @@ class GimmeAWSCreds(object):
 
     def handle_action_register_device(self):
         # Capture the Device Token and write it to the config file
-        if self.device_token is None or self.config.action_register_device is True:
+        if self.okta_platform == "classic" and self.skip_DT is False and ( not self.device_token or self.config.action_register_device is True ):
             if not self.config.action_register_device:
                 self.ui.notify('\n*** No device token found in configuration file, it will be created.')
                 self.ui.notify('*** You may be prompted for MFA more than once for this run.\n')
